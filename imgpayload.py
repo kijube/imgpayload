@@ -5,7 +5,7 @@ import threading
 import time
 from argparse import ArgumentParser
 from os import mkdir
-from os.path import join, basename
+from os.path import join, basename, splitext
 from queue import Queue, Empty
 from shlex import split
 from shutil import copy
@@ -44,6 +44,7 @@ JOB_TYPE_CHECK_IMAGE = "job_check_image"
 JOB_TYPE_INJECT_PAYLOAD = "job_inject_payload"
 
 JOB_RESULT_CHECK_IMAGE_FAILED = "check_image_failed"
+JOB_RESULT_CHECK_IMAGE_SUCCEEDED = "check_image_succeeded"
 
 
 def parse_arguments():
@@ -162,7 +163,6 @@ class ImgPayloader:
                     job = img_ctx.get_new_job()
                     if job is not None:
                         self.job_queue.put(job)
-                        print(job)
 
                 # process thread messages
                 for worker in self.workers:
@@ -241,6 +241,9 @@ class ImageContext:
             self.try_inject_payload()
         elif job_type == JOB_TYPE_INJECT_PAYLOAD:
             self.add_check_job(job_result)
+        elif job_type == JOB_TYPE_CHECK_IMAGE:
+            if job_result.result[0] == JOB_RESULT_CHECK_IMAGE_SUCCEEDED:
+                self.handle_successful_injection(job_result)
 
     def try_inject_payload(self):
         for match in self.block_matches:
@@ -249,6 +252,14 @@ class ImageContext:
     def add_check_job(self, job_result):
         img_file = job_result.result
         self.jobs.put(JobInfo(self, JOB_TYPE_CHECK_IMAGE, (img_file)))
+
+    def handle_successful_injection(self, job_result):
+        with open(job_result.result[1], "rb") as fi:
+            _, ext = splitext(self.name)
+            path = join(RESULTS_DIR, basename(job_result.result[1]) + "_success" + ext)
+            with open(path, "wb") as fo:
+                fo.write(fi.read())
+        print(f"[bold green]Success! [/bold green][green]Payload was injected into image {self.name} (written to: {path})[/green]")
 
 
 class JobInfo:
@@ -294,7 +305,7 @@ class WorkerThread(threading.Thread):
 
     def work(self):
         self.cooldown = WORKER_COOLDOWN
-        self.log("got new job " + str(self.job_info))
+        #self.log("got new job " + str(self.job_info))
         handler = self.job_handlers[self.job_info.job_type]
         handler(self.job_info, self.job_info.job_args)
 
@@ -335,6 +346,9 @@ class WorkerThread(threading.Thread):
         edited_data += bytes(payload)
         edited_data += bytes(data[match.index + len(payload):])
 
+        with open(img, "wb") as f:
+            f.write(edited_data)
+
         self.send_result(img)
 
     def check_image(self, job_info: JobInfo, args):
@@ -346,19 +360,27 @@ class WorkerThread(threading.Thread):
             return
 
         data = read(result_file)
-        if bytes(self.payloader.payload, "ascii") in data:# todo make encoding changeable?
-            print("FUCK YEAH")
+        if bytes(self.payloader.payload, "ascii") in data:  # todo make encoding changeable?
+            self.send_result((JOB_RESULT_CHECK_IMAGE_SUCCEEDED, result_file))
 
     def compare_blocks(self, job_info: JobInfo, args):
         original = job_info.img_context.create_tmp_copy()
         to_process = job_info.img_context.create_tmp_copy()
         processed = to_process + "_prcd"
-        success = self.payloader.run_beat_cmd(to_process, processed)
+        success, out, err = self.payloader.run_beat_cmd(to_process, processed)
         if not success:
             self.log("[red]Something went wrong when executing the beat cmd while comparing blocks.[/red]")
             return
 
         original_data = read(original)
+
+        if not exists(processed):
+            self.log(f"[red]Error! Processed file does not exist for image {self.job_info.img_context.name}[/red]")
+            if len(err) > 0:
+                self.log("Received error output:")
+                self.log(err)
+            return
+
         processed_data = read(processed)
 
         block_matches = []
