@@ -6,13 +6,15 @@ import time
 from argparse import ArgumentParser
 from os import mkdir
 from os.path import join, basename, splitext
-from queue import Queue, Empty
+from queue import Queue, Empty, PriorityQueue
 from shlex import split
 from shutil import copy
 
+from dataclasses import field, dataclass
 from rich import print
 from rich.markup import escape
 from rich.progress import Progress
+from typing import List, Any
 
 from utils import *
 
@@ -60,6 +62,10 @@ def parse_arguments():
     parser.add_argument("--shell", type=str, required=False, default="sh",
                         help="The shell to run the beat command with")
     parser.add_argument("--threads", type=int, required=False, default=2, help="The amount of threads to use")
+    parser.add_argument("--cmd-timeout", type=int, default=10, required=False,
+                        help="The timeout in seconds for the beat command")
+    parser.add_argument("--print-errors", type=bool, default=False, required=False,
+                        help="Print errors produced by the beat command?")
 
     return parser.parse_args()
 
@@ -81,26 +87,31 @@ def main():
     thread_count = args.threads
     shell = args.shell
     split_by = args.split_by
+    cmd_timeout = args.cmd_timeout
+    print_errors = args.print_errors
 
     cleanup_dirs()
 
-    payloader = ImgPayloader(source_image_files, payload, beat_cmd, thread_count, shell, split_by)
+    payloader = ImgPayloader(source_image_files, payload, beat_cmd, thread_count, shell, split_by, cmd_timeout,
+                             print_errors)
     payloader.run()
 
 
 class ImgPayloader:
-    def __init__(self, source_imgs, payload, beat_cmd: str, thread_count, shell, split_by):
+    def __init__(self, source_imgs, payload, beat_cmd: str, thread_count, shell, split_by, cmd_timeout, print_errors):
         self.source_imgs = source_imgs
         self.shell = shell
         self.payload = payload
         self.beat_cmd = beat_cmd
         self.imgs = []
+        self.cmd_timeout = cmd_timeout
+        self.print_errors = print_errors
         self.global_task = None
         self.split_by = split_by
         self.thread_count = max(1, thread_count)
-        self.img_contexts: list[ImageContext] = []
-        self.workers: list[WorkerThread] = []
-        self.job_queue = Queue()
+        self.img_contexts: List[ImageContext] = []
+        self.workers: List[WorkerThread] = []
+        self.job_queue = PriorityQueue()
 
     # Copy image files that should be injected to temp directory
     def copy_source_images(self):
@@ -116,7 +127,7 @@ class ImgPayloader:
         proc = subprocess.Popen(cmd_args, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # noinspection PyBroadException
         try:
-            out, errs = proc.communicate(timeout=10)  # todo make changeable
+            out, errs = proc.communicate(timeout=self.cmd_timeout)
             # rm_file(file)
             return True, out, errs
         except:
@@ -161,7 +172,7 @@ class ImgPayloader:
 
         print("")
         with Progress() as progress:
-            self.global_task = progress.add_task("[green]\\[total progress][/green]", total=len(self.imgs))
+            self.global_task = progress.add_task("[green]<total progress>[/green]", total=len(self.imgs))
 
             for img_ctx in self.img_contexts:
                 task = progress.add_task(img_ctx.prefix + "...")
@@ -186,7 +197,7 @@ class ImgPayloader:
                         msg_val = msg[1]
 
                         if msg_type == MSG_TYPE_LOG:
-                            print(msg_val)
+                            progress.print(msg_val)
                         elif msg_type == MSG_TYPE_RESULT:
                             job_result = msg_val
                             worker.job_info.img_context.receive_result(job_result)
@@ -194,6 +205,13 @@ class ImgPayloader:
                             if msg_val == MSG_STATUS_DONE:
                                 worker.job_info.img_context.update_remaining_jobs(-1, progress)
                                 progress.advance(self.global_task, 1)
+
+                # print all context messages
+                for img_ctx in self.img_contexts:
+                    while not img_ctx.logs.empty():
+                        progress.print(img_ctx.logs.get())
+
+                progress.refresh()
         print("YES ALL IS DONE")
 
     def print_start_info(self):
@@ -224,8 +242,9 @@ class ImageContext:
         self.remaining_jobs = 0
         self.total_jobs = 0
         self.jobs = Queue()
+        self.logs = Queue()
 
-        self.block_matches: list[BlockMatch] = None
+        self.block_matches: List[BlockMatch] = None
 
         self.add_start_jobs()
 
@@ -251,7 +270,7 @@ class ImageContext:
         return None
 
     def add_start_jobs(self):
-        self.jobs.put(JobInfo(self, JOB_TYPE_BLOCK_MATCHES, None))
+        self.jobs.put(JobInfo(0, self, JOB_TYPE_BLOCK_MATCHES, None))
 
     def receive_result(self, job_result):
         job_type = job_result.job_info.job_type
@@ -264,19 +283,24 @@ class ImageContext:
             if job_result.result[0] == JOB_RESULT_CHECK_IMAGE_SUCCEEDED:
                 self.handle_successful_injection(job_result)
 
+    def log(self, msg):
+        self.logs.put(f"[green]tm[/green][blue]-{self.name}:[/blue] {msg}")
+
     def try_inject_payload(self):
         if self.payloader.split_by is not None:
             permutations = self.find_split_permutations()
-            print(f"{self.prefix}: Found {len(permutations)} split permutations for the payload")
+            self.log(f"Found {len(permutations)} split permutations for the payload")
             for perm in permutations:
-                self.jobs.put(JobInfo(self, JOB_TYPE_INJECT_PAYLOAD, ("split", perm)))
+                self.jobs.put(JobInfo(100, self, JOB_TYPE_INJECT_PAYLOAD, ("split", perm)))
 
         for match in self.block_matches:
-            self.jobs.put(JobInfo(self, JOB_TYPE_INJECT_PAYLOAD, ("default", match)))
+            self.jobs.put(JobInfo(110, self, JOB_TYPE_INJECT_PAYLOAD, ("default", match)))
 
     def add_check_job(self, job_result):
         img_file = job_result.result
-        self.jobs.put(JobInfo(self, JOB_TYPE_CHECK_IMAGE, (img_file, job_result.job_info.job_args[0])))
+        mode = job_result.job_info.job_args[0]
+        priority = 50
+        self.jobs.put(JobInfo(priority, self, JOB_TYPE_CHECK_IMAGE, (img_file,mode)))
 
     def handle_successful_injection(self, job_result):
         with open(job_result.result[1], "rb") as fi:
@@ -284,7 +308,7 @@ class ImageContext:
             path = join(RESULTS_DIR, basename(job_result.result[1]) + "_success" + ext)
             with open(path, "wb") as fo:
                 fo.write(fi.read())
-        print(
+        self.log(
             f"[bold green]Success! [/bold green][green]Payload was injected into image {self.name} (written to: {path})[/green]")
 
     def find_split_permutations(self):
@@ -317,11 +341,12 @@ class ImageContext:
                         total=self.total_jobs, advance=delta)
 
 
+@dataclass(order=True)
 class JobInfo:
-    def __init__(self, img_context: ImageContext, job_type, job_data):
-        self.img_context = img_context
-        self.job_type = job_type
-        self.job_args = job_data
+    priority: int
+    img_context: ImageContext = field(compare=False)
+    job_type: str = field(compare=False)
+    job_args: Any = field(compare=False)
 
     def __str__(self):
         return f"Job '{self.job_type}' for image '{self.img_context.name}' with args '{str(self.job_args)[:100]}'"
@@ -391,7 +416,7 @@ class WorkerThread(threading.Thread):
                 if self.cooldown < 0:
                     self.is_working = False
 
-    def inject_payload(self, job_info: JobInfo, args):
+    def inject_payload(self, job_info: JobInfo, args: Any):
         img = None
         edited_data = b""
 
@@ -432,13 +457,13 @@ class WorkerThread(threading.Thread):
 
         self.send_result(img)
 
-    def check_image(self, job_info: JobInfo, args):
+    def check_image(self, job_info: JobInfo, args: Any):
         img_file = args[0]
         mode = args[1]
         result_file = img_file + "_prcd"
         success, out, err = self.payloader.run_beat_cmd(img_file, result_file)
         if not exists(result_file):
-            if len(err) > 0: # todo maybe add print error switch?
+            if len(err) > 0 and self.payloader.print_errors:
                 self.log(f"[red]Got an error when checking image {self.job_info.img_context.name}:[/red]")
                 self.log(err)
             self.send_result((JOB_RESULT_CHECK_IMAGE_FAILED,))
@@ -462,13 +487,16 @@ class WorkerThread(threading.Thread):
             self.send_result((JOB_RESULT_CHECK_IMAGE_SUCCEEDED, img_file))
             return
 
-    def compare_blocks(self, job_info: JobInfo, args):
+    def compare_blocks(self, job_info: JobInfo, args: Any):
         original = job_info.img_context.create_tmp_copy()
         to_process = job_info.img_context.create_tmp_copy()
         processed = to_process + "_prcd"
         success, out, err = self.payloader.run_beat_cmd(to_process, processed)
         if not success:
             self.log("[red]Something went wrong when executing the beat cmd while comparing blocks.[/red]")
+            if len(err) > 0:
+                self.log("Received error output:")
+                self.log(err)
             return
 
         original_data = read(original)
@@ -503,10 +531,11 @@ class WorkerThread(threading.Thread):
         block_matches = list(block_matches)
         list.sort(block_matches, key=lambda x: x.index)
 
-        # todo if no block matches found return immediately
-        # todo check if payload fits inside?
-
-        self.log(f"Found {len(block_matches)} block matches")
+        if len(block_matches) == 0:
+            self.log(f"No block matches found. Trying bruteforce injector.")
+            # todo bruteforce injector
+        else:
+            self.log(f"Found {len(block_matches)} block matches")
 
         self.send_result(block_matches)
 
