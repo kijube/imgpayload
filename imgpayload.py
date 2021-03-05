@@ -49,6 +49,9 @@ JOB_TYPE_INJECT_PAYLOAD = "job_inject_payload"
 JOB_RESULT_CHECK_IMAGE_FAILED = "check_image_failed"
 JOB_RESULT_CHECK_IMAGE_SUCCEEDED = "check_image_succeeded"
 
+JOB_INJECT_MODE_DEFAULT = "default"
+JOB_INJECT_MODE_SPLIT = "split"
+
 
 def parse_arguments():
     parser = ArgumentParser()
@@ -291,16 +294,16 @@ class ImageContext:
             permutations = self.find_split_permutations()
             self.log(f"Found {len(permutations)} split permutations for the payload")
             for perm in permutations:
-                self.jobs.put(JobInfo(100, self, JOB_TYPE_INJECT_PAYLOAD, ("split", perm)))
+                self.jobs.put(JobInfo(100, self, JOB_TYPE_INJECT_PAYLOAD, (JOB_INJECT_MODE_SPLIT, perm)))
 
         for match in self.block_matches:
-            self.jobs.put(JobInfo(110, self, JOB_TYPE_INJECT_PAYLOAD, ("default", match)))
+            self.jobs.put(JobInfo(110, self, JOB_TYPE_INJECT_PAYLOAD, (JOB_INJECT_MODE_DEFAULT, match)))
 
     def add_check_job(self, job_result):
         img_file = job_result.result
         mode = job_result.job_info.job_args[0]
         priority = 50
-        self.jobs.put(JobInfo(priority, self, JOB_TYPE_CHECK_IMAGE, (img_file,mode)))
+        self.jobs.put(JobInfo(priority, self, JOB_TYPE_CHECK_IMAGE, (img_file, mode)))
 
     def handle_successful_injection(self, job_result):
         with open(job_result.result[1], "rb") as fi:
@@ -314,17 +317,33 @@ class ImageContext:
     def find_split_permutations(self):
         parts = self.payloader.payload.split(self.payloader.split_by)
         permutations = []
+        # find split permutations starting from every surviving block
         for block_start in range(0, len(self.block_matches)):
             curr_perm = []
             part_idx = 0
-            for curr_block_idx in range(block_start, len(self.block_matches)):
+            running = True
+            # index of current surviving block
+            curr_block_idx = 0
+            # position in current surviving block (if block is so large that multiple split parts fit inside)
+            curr_pos_in_block = 0
+            while running:
+                # if permutation contains all parts -> finished success
                 if len(curr_perm) == len(parts):
+                    running = False
                     continue
                 part = parts[part_idx]
                 curr_block = self.block_matches[curr_block_idx]
-                if curr_block.size >= len(part):
+                # check if current block (also) fits current part
+                # todo maybe only > and not >=?
+                if curr_block.size >= len(part) + curr_pos_in_block:
+                    # if yes, add block to current perm and also add size to position in block
                     curr_perm.append(curr_block_idx)
+                    curr_pos_in_block += len(part)
                     part_idx += 1
+                else:
+                    # if not, check next block at index 0
+                    curr_block_idx += 1
+                    curr_pos_in_block = 0
 
             if len(curr_perm) == len(parts):
                 permutations.append(curr_perm)
@@ -420,7 +439,7 @@ class WorkerThread(threading.Thread):
         img = None
         edited_data = b""
 
-        if args[0] == "default":
+        if args[0] == JOB_INJECT_MODE_DEFAULT:
             img = self.job_info.img_context.create_tmp_copy("_def")
             data = read(img)
             match: BlockMatch = args[1]
@@ -429,7 +448,7 @@ class WorkerThread(threading.Thread):
             edited_data += bytes(payload)
             edited_data += bytes(data[match.index + len(payload):])
 
-        elif args[0] == "split":
+        elif args[0] == JOB_INJECT_MODE_SPLIT:
             img = self.job_info.img_context.create_tmp_copy("_splt")
             data = read(img)
             permutation = args[1]
@@ -437,6 +456,7 @@ class WorkerThread(threading.Thread):
                        self.payloader.payload.split(self.payloader.split_by)]  # todo make encoding changeable?
             curr_idx = 0
             payload_idx = 0
+
             for perm_match in permutation:
                 match = self.job_info.img_context.block_matches[perm_match]
 
@@ -492,17 +512,11 @@ class WorkerThread(threading.Thread):
         to_process = job_info.img_context.create_tmp_copy()
         processed = to_process + "_prcd"
         success, out, err = self.payloader.run_beat_cmd(to_process, processed)
-        if not success:
-            self.log("[red]Something went wrong when executing the beat cmd while comparing blocks.[/red]")
-            if len(err) > 0:
-                self.log("Received error output:")
-                self.log(err)
-            return
-
         original_data = read(original)
 
         if not exists(processed):
-            self.log(f"[red]Error! Processed file does not exist for image {self.job_info.img_context.name}[/red]")
+            self.log(
+                f"[red]Error! Can't compare blocks of file '{self.job_info.img_context.name}' because processed file does not exist.[/red]")
             if len(err) > 0:
                 self.log("Received error output:")
                 self.log(err)
